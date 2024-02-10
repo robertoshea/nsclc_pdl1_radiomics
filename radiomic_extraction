@@ -1,0 +1,449 @@
+#replica radiomics 12_11_23
+
+# <editor-fold desc="">
+# </editor-fold>
+
+# <editor-fold desc="Import Libraries">
+import os
+import pandas as pd
+import numpy as np
+import SimpleITK as sitk
+import cc3d
+import radiomics
+from radiomics import featureextractor
+import re
+# </editor-fold>
+
+# <editor-fold desc="Utility Functions">
+
+
+def rec_listdir(path):
+    files = []
+    for r, d, f in os.walk(path):
+        for f_i in f:
+            files.append(os.path.join(r, f_i))
+    return files
+
+
+def make_newdir(dir_path):
+    if not os.path.exists(dir_path):
+        os.mkdir(dir_path)
+
+# </editor-fold>
+
+# <editor-fold desc="Radiomic extractors">
+logger = radiomics.logging.getLogger("radiomics")
+logger.setLevel(radiomics.logging.ERROR)
+radiomics_output_dir = 'radiomic_features_' + '12_11_23_all_types'
+make_newdir(radiomics_output_dir)
+radiomic_features_df = []
+
+# O'Shea
+extractor_oshea = featureextractor.RadiomicsFeatureExtractor(normalize=False,
+                                                               interpolator='sitkLinear',
+                                                               resampledPixelSpacing=[1., 0, 0],
+                                                               bin_width=10,
+                                                               preCrop=True)
+
+# Jiang
+extractor_jiang = featureextractor.RadiomicsFeatureExtractor(normalize=False,
+                                                             binwidth=25,
+                                                             interpolator='sitkLinear',
+                                                             resampledPixelSpacing=[1., 1., 1.],
+                                                             voxelArrayShift=1000,
+                                                             sigma=[4.],
+                                                             preCrop=True)
+extractor_jiang.disableAllImageTypes()
+extractor_jiang.enableImageTypeByName('Wavelet')
+extractor_jiang.enableImageTypeByName('LoG')
+extractor_jiang.disableAllFeatures()
+extractor_jiang.enableFeaturesByName(firstorder=['Kurtosis', 'Median', 'Skewness', 'RootMeanSquared'],
+                                     glcm=['ClusterShade', 'Idn'],
+                                     glszm=['SmallAreaLowGrayLevelEmphasis',
+                                            'SizeZoneNonUniformityNormalized'
+                                            ],
+                                     ngtdm=['Complexity'])
+
+
+# </editor-fold>
+
+# <editor-fold desc="REPLICA radiomics all extraction types">
+main_dir = r'C:\Users\ro20\Documents\Datasets\REPLICA\nii'
+img_dir = os.path.join(main_dir, 'img')
+img_files = rec_listdir(img_dir)
+seg_dir = os.path.join(main_dir, 'seg_29_06_23')
+seg_files = rec_listdir(seg_dir)
+seg_annotators = []
+for seg_file_i in seg_files:
+    seg_file_i = os.path.basename(seg_file_i).lower()
+    if "chtm" in seg_file_i or "tmch" in seg_file_i:
+        seg_annotators.append("CHTM")
+    elif "ch" in seg_file_i:
+        seg_annotators.append("CH")
+    elif "tm" in seg_file_i:
+        seg_annotators.append("TM")
+    else:
+        seg_annotators.append("RO")
+
+img_df = pd.DataFrame({
+    'img_file': img_files,
+    'patient_id': [os.path.basename(i).split('_')[0] for i in img_files],
+})
+
+seg_df = pd.DataFrame({
+    'seg_file': seg_files,
+    'patient_id': [os.path.basename(i).split('_')[0] for i in seg_files],
+    'corrupt': ['cor' in os.path.basename(i) for i in seg_files],
+    'annotator': seg_annotators
+})
+img_df = pd.merge(img_df, seg_df, how='outer')
+img_df.corrupt = img_df.corrupt.astype('bool')
+
+acq_params_file = 'acq_params_03_10_2022' + '\\' + "replica" + '.csv'
+acq_params_df = pd.read_csv(acq_params_file).iloc[:, 1:]
+acq_params_df.patient_id = acq_params_df.patient_id.astype(str)
+img_df = pd.merge(img_df, acq_params_df, on='patient_id')
+
+exclusions_df = []
+radiomic_features_df = []
+for obs_i in range(len(img_df)):
+
+    print('replica radiomics ', obs_i)
+    img_file_i = img_df.img_file[obs_i]
+    seg_file_i = img_df.seg_file[obs_i]
+    patient_id_i = os.path.basename(img_file_i)[:-4]
+    acq_params_i = img_df[acq_params_df.columns].iloc[obs_i]
+    slice_thickness_i = img_df.acq_slice_thickness[obs_i]
+    corrupt_i = img_df.corrupt[obs_i]
+    if slice_thickness_i > 2.5:
+        exclusion_i = {'patient_id': patient_id_i, 'exclusion_criterion': 'thick_slice'}
+        exclusions_df.append(exclusion_i)
+        continue
+    if corrupt_i:
+        exclusion_i = {'patient_id': patient_id_i, 'exclusion_criterion': 'corrupt'}
+        exclusions_df.append(exclusion_i)
+        continue
+    voxel_dim_i = img_df.acq_voxel_dim[obs_i]
+    spacing_i = [slice_thickness_i, voxel_dim_i, voxel_dim_i]
+    spacing_i = [round(i, 5).astype(float) for i in spacing_i]
+    img_arr_i = sitk.GetArrayFromImage(sitk.ReadImage(img_file_i))
+    seg_arr_i = sitk.GetArrayFromImage(sitk.ReadImage(seg_file_i))
+
+    if len(img_arr_i) > len(seg_arr_i):
+        img_arr_i = img_arr_i[1:]
+
+    seg_arr_i[img_arr_i < -100] = 0
+
+    if seg_arr_i.sum() > 10:
+        # extract largest roi
+        seg_rois = cc3d.connected_components(seg_arr_i,
+                                             connectivity=26)
+        roi_labels, roi_volumes = np.unique(seg_rois, return_counts=True)
+        nonzero_labels = roi_labels != 0
+        roi_labels = roi_labels[nonzero_labels]
+        roi_volumes = roi_volumes[nonzero_labels]
+        largest_roi = roi_labels[np.argmax(roi_volumes)]
+        seg_arr_i = (seg_rois == largest_roi).astype(np.uint8)
+
+        # extract features
+        img_sitk_i = sitk.GetImageFromArray(img_arr_i)
+        seg_sitk_i = sitk.GetImageFromArray(seg_arr_i)
+        img_sitk_i.SetSpacing(spacing_i)
+        seg_sitk_i.SetSpacing(spacing_i)
+        radiomic_features_oshea_i = extractor_oshea.execute(img_sitk_i, seg_sitk_i)
+        radiomic_features_oshea_i = {'oshea_' + k: v for k, v in radiomic_features_oshea_i.items() if
+                                     not k.startswith('diagnostics_')}
+        radiomic_features_jiang_i = extractor_jiang.execute(img_sitk_i, seg_sitk_i)
+        radiomic_features_jiang_i = {'jiang_' + k: v for k, v in radiomic_features_jiang_i.items() if
+                                     not k.startswith('diagnostics_')}
+        radiomic_features_i = {
+            **radiomic_features_oshea_i,
+            **radiomic_features_jiang_i,
+        }
+        radiomic_features_i = pd.DataFrame([radiomic_features_i])
+        radiomic_features_i['id'] = patient_id_i
+        radiomic_features_i['dataset'] = 'replica'
+        radiomic_features_i['annotator'] = img_df.annotator[obs_i]
+        radiomic_features_i[acq_params_df.columns] = acq_params_i
+        radiomic_features_df.append(radiomic_features_i)
+
+# organise and export features
+radiomic_features_df = pd.concat(radiomic_features_df, axis=0)
+radiomic_features_df_path = radiomics_output_dir + r'/' + 'replica.csv'
+radiomic_features_df.to_csv(radiomic_features_df_path)
+exclusions_df = pd.DataFrame(exclusions_df)
+exclusions_df.to_csv(radiomics_output_dir + r'/' + 'replica_exclusions.csv')
+# </editor-fold>
+
+# <editor-fold desc="Lung2 Radiomics all extraction types">
+img_dir = r'C:\Users\ro20\Documents\Datasets\Lung2\NPY\img'
+seg_output_dir = r'C:\Users\ro20\Documents\Datasets\Lung2\NPY\seg_gtv'
+acq_params_file = 'acq_params_03_10_2022' + '\\' + 'lung2.csv'
+
+# file management
+img_files = rec_listdir(img_dir)
+seg_files = rec_listdir(seg_output_dir)
+img_df = pd.DataFrame({
+    'id': [os.path.basename(i)[:-4] for i in img_files],
+    'img_file': img_files,
+})
+seg_df = pd.DataFrame({
+    'id': [os.path.basename(i)[:-4] for i in seg_files],
+    'seg_file': seg_files,
+})
+img_df = pd.merge(img_df, seg_df, on='id')
+
+acq_params_df = pd.read_csv(acq_params_file).iloc[:, 1:]
+acq_params_df['id'] = acq_params_df.patient_id.astype(str) + '_' + acq_params_df.study_date.astype(str)
+img_df = pd.merge(img_df, acq_params_df, on='id')
+img_df.reset_index(inplace=True)
+
+radiomic_features_df = []
+for obs_i in range(len(img_df)):
+
+    print('lung2 radiomics ', obs_i)
+    img_file_i = img_df.img_file[obs_i]
+    seg_file_i = img_df.seg_file[obs_i]
+    patient_id_i = os.path.basename(img_file_i)[:-4]
+    acq_params_i = img_df[acq_params_df.columns].iloc[obs_i]
+    slice_thickness_i = img_df.acq_slice_thickness[obs_i]
+    voxel_dim_i = img_df.acq_voxel_dim[obs_i]
+    spacing_i = [slice_thickness_i, voxel_dim_i, voxel_dim_i]
+    spacing_i = [round(i, 5).astype(float) for i in spacing_i]
+    img_arr_i = np.load(img_file_i)
+    seg_arr_i = np.squeeze(np.load(seg_file_i))
+    seg_arr_i[img_arr_i < -100] = False
+
+    if seg_arr_i.sum() > 10:
+        # extract largest roi
+        seg_rois = cc3d.connected_components(seg_arr_i,
+                                             connectivity=26)
+        roi_labels, roi_volumes = np.unique(seg_rois, return_counts=True)
+        nonzero_labels = roi_labels != 0
+        roi_labels = roi_labels[nonzero_labels]
+        roi_volumes = roi_volumes[nonzero_labels]
+        largest_roi = roi_labels[np.argmax(roi_volumes)]
+        seg_arr_i = (seg_rois == largest_roi).astype(np.uint8)
+
+        # extract features
+        img_sitk_i = sitk.GetImageFromArray(img_arr_i)
+        seg_sitk_i = sitk.GetImageFromArray(seg_arr_i)
+        img_sitk_i.SetSpacing(spacing_i)
+        seg_sitk_i.SetSpacing(spacing_i)
+        radiomic_features_oshea_i = extractor_oshea.execute(img_sitk_i, seg_sitk_i)
+        radiomic_features_oshea_i = {'oshea_' + k: v for k, v in radiomic_features_oshea_i.items() if
+                                     not k.startswith('diagnostics_')}
+        radiomic_features_jiang_i = extractor_jiang.execute(img_sitk_i, seg_sitk_i)
+        radiomic_features_jiang_i = {'jiang_' + k: v for k, v in radiomic_features_jiang_i.items() if
+                                     not k.startswith('diagnostics_')}
+        radiomic_features_i = {
+            **radiomic_features_oshea_i,
+            ** radiomic_features_jiang_i,
+        }
+        radiomic_features_i = pd.DataFrame([radiomic_features_i])
+        radiomic_features_i['id'] = patient_id_i
+        radiomic_features_i['dataset'] = 'lung2'
+        radiomic_features_i['annotator'] = 'NA'
+        radiomic_features_i[acq_params_df.columns] = acq_params_i
+        radiomic_features_df.append(radiomic_features_i)
+
+
+# organise and export features
+radiomic_features_df = pd.concat(radiomic_features_df, axis=0)
+radiomic_features_df_path = radiomics_output_dir + r'/lung2.csv'
+radiomic_features_df.to_csv(radiomic_features_df_path)
+
+# </editor-fold>
+
+
+
+
+
+
+# <editor-fold desc="Visualisation">
+
+from radiomics import featureextractor
+from decimal import Decimal
+import matplotlib.pyplot as plt
+extractor = featureextractor.RadiomicsFeatureExtractor()
+extractor.disableAllFeatures()
+extractor.enableFeaturesByName(firstorder=['TotalEnergy'],
+                               gldm=['DependenceVariance']
+                               )
+feature_tnames = ['original_firstorder_TotalEnergy',
+                  'original_gldm_DependenceVariance']
+
+selected_df = pd.read_csv(
+    "C:/Users/ro20/Documents/R Projects/replica/pdl1_28_06_23/tables/selected_df.csv")
+selected_df.patient_id = selected_df.patient_id.astype('str')
+
+main_dir = r'C:\Users\ro20\Documents\Datasets\REPLICA\nii'
+img_dir = os.path.join(main_dir, 'img')
+img_files = rec_listdir(img_dir)
+seg_dir = os.path.join(main_dir, 'seg_21_06_23')
+seg_files = rec_listdir(seg_dir)
+seg_annotators = []
+for seg_file_i in seg_files:
+    seg_file_i = os.path.basename(seg_file_i).lower()
+    if "chtm" in seg_file_i or "tmch" in seg_file_i:
+        seg_annotators.append("CHTM")
+    elif "ch" in seg_file_i:
+        seg_annotators.append("CH")
+    elif "tm" in seg_file_i:
+        seg_annotators.append("TM")
+    else:
+        seg_annotators.append("RO")
+
+img_df = pd.DataFrame({
+    'img_file': img_files,
+    'patient_id': [os.path.basename(i).split('_')[0] for i in img_files],
+})
+
+seg_df = pd.DataFrame({
+    'seg_file': seg_files,
+    'patient_id': [os.path.basename(i).split('_')[0] for i in seg_files],
+    'corrupt': ['cor' in os.path.basename(i) for i in seg_files],
+    'annotator': seg_annotators
+})
+img_df = pd.merge(img_df, seg_df, how='outer')
+
+selected_ids = selected_df.patient_id.astype('str')
+img_df = img_df.loc[img_df.patient_id.isin(selected_ids), :]
+img_df = img_df.loc[~img_df.patient_id.duplicated(), :].reset_index()
+img_df.patient_id = img_df.patient_id.astype('str')
+img_df = pd.merge(selected_df, img_df)
+img_df.reset_index(inplace=True)
+
+img_df['pd2'] = 'PD-L1: '+ img_df.pdl1.astype(str) + '%'
+img_df['te2'] = ['TE: '+ '%.1E' % Decimal(i) for i in img_df.original_firstorder_TotalEnergy]
+img_df['dv2'] = 'DV: ' + img_df.original_gldm_DependenceVariance.round(2).astype(str)
+
+plt.close()
+fig, axs = plt.subplots(3, len(img_df))
+plt.setp(axs.flat, xticks=[], yticks=[])
+for obs_i in range(len(img_df)):
+
+    patient_id = img_df.patient_id[obs_i]
+
+    img_file = img_df.img_file[obs_i]
+    seg_file = img_df.seg_file[obs_i]
+    img = sitk.GetArrayFromImage(sitk.ReadImage(img_file))
+    seg = sitk.GetArrayFromImage(sitk.ReadImage(seg_file))
+
+    img = np.clip(img, a_min=-900, a_max=300)
+    midpoint = np.median(np.where(seg), axis=1).astype(int)
+    slice_idx = np.argmax(seg.sum(axis=(1, 2)))
+    start_idx_1 = midpoint[1] - 100
+    end_idx_1 = midpoint[1] + 100
+    start_idx_2 = midpoint[2] - 100
+    end_idx_2 = midpoint[2] + 100
+    img_i = img[slice_idx, start_idx_1:end_idx_1, start_idx_2:end_idx_2, np.newaxis]
+    seg_i = seg[slice_idx, start_idx_1:end_idx_1, start_idx_2:end_idx_2, np.newaxis] * 1
+    seg_i[img_i < -100] = 0
+
+    # extract features
+    img_sitk_i = sitk.GetImageFromArray(img_i)
+    seg_sitk_i = sitk.GetImageFromArray(seg_i)
+    radiomic_features_i = extractor.execute(img_sitk_i, seg_sitk_i, voxelBased=True)
+    bb = radiomic_features_i['diagnostics_Mask-original_BoundingBox']
+    y_i = []
+    for feature_i in range(len(feature_tnames)):
+        y_ii = sitk.GetArrayFromImage(radiomic_features_i[feature_tnames[feature_i]])
+        y_ii2 = np.zeros_like(img_i, dtype=np.float64)
+        y_ii2[(bb[2] - 1):(bb[2] + bb[5] + 1), (bb[1] - 1):(bb[1] + bb[4] + 1), ] = y_ii
+        y_i.append(y_ii2)
+    all_i = [-img_i, seg_i] + y_i
+
+    axs[0, obs_i].imshow(img_i,
+                         vmin=-900,
+                         vmax=300,
+                         cmap='Greys_r')
+
+    axs[1, obs_i].imshow(img_i,
+                         vmin=-900,
+                         vmax=300,
+                         cmap='Greys_r')
+
+    axs[1, obs_i].imshow(np.log(y_i[0]+1),
+                         vmax=13,
+                         cmap='Greens', alpha=0.5)
+
+    axs[2, obs_i].imshow(img_i,
+                         vmin=-900,
+                         vmax=300,
+                         cmap='Greys_r')
+
+    axs[2, obs_i].imshow(np.log(y_i[1]+1),
+                         vmax=1.6,
+                         cmap='Reds', alpha=0.5)
+
+# Labelling
+
+titles = ['Image', 'TotalEnergy', 'DependenceVariance']
+for i in range(len(titles)):
+    axs[i, 0].set_ylabel(titles[i], fontsize=8,
+                         rotation=0,
+                         labelpad=50)
+for i in range(len(img_df)):
+    axs[0, i].set_xlabel(img_df.pd2[i],
+                         fontsize=8
+                         )
+    axs[1, i].set_xlabel(img_df.te2[i],
+                         fontsize=8
+                         )
+
+    axs[2, i].set_xlabel(img_df.dv2[i],
+                         fontsize=8
+                         )
+
+plt.savefig(fname='figures/replica_pdl1_vis_21_11_23.png',
+            dpi=600,
+            bbox_inches="tight"
+            )
+
+# plotting segmentations
+plt.close()
+fig, axs = plt.subplots(2, len(img_df))
+plt.setp(axs.flat, xticks=[], yticks=[])
+for obs_i in range(len(img_df)):
+
+    patient_id = img_df.patient_id[obs_i]
+
+    img_file = img_df.img_file[obs_i]
+    seg_file = img_df.seg_file[obs_i]
+    img = sitk.GetArrayFromImage(sitk.ReadImage(img_file))
+    seg = sitk.GetArrayFromImage(sitk.ReadImage(seg_file))
+
+    img = np.clip(img, a_min=-900, a_max=300)
+    midpoint = np.median(np.where(seg), axis=1).astype(int)
+    slice_idx = np.argmax(seg.sum(axis=(1, 2)))
+    start_idx_1 = midpoint[1] - 100
+    end_idx_1 = midpoint[1] + 100
+    start_idx_2 = midpoint[2] - 100
+    end_idx_2 = midpoint[2] + 100
+    img_i = img[slice_idx, start_idx_1:end_idx_1, start_idx_2:end_idx_2, np.newaxis]
+    seg_i = seg[slice_idx, start_idx_1:end_idx_1, start_idx_2:end_idx_2, np.newaxis] * 1
+
+    # extract features
+    img_sitk_i = sitk.GetImageFromArray(img_i)
+    seg_sitk_i = sitk.GetImageFromArray(seg_i)
+    axs[0, obs_i].imshow(img_i,
+                         vmin=-900,
+                         vmax=300,
+                         cmap='Greys_r')
+
+    axs[1, obs_i].imshow(img_i,
+                         vmin=-900,
+                         vmax=300,
+                         cmap='Greys_r')
+
+    axs[1, obs_i].imshow(seg_i,
+                         cmap='Blues', alpha=0.7)
+
+plt.savefig(fname='figures/replica_pdl1_segex_29_06_23.png',
+            dpi=600,
+            bbox_inches="tight"
+            )
+
+
+# </editor-fold>
