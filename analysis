@@ -1,0 +1,1024 @@
+# pdl1 19_11_23 thresholded lung2 segmentation
+
+#libraries
+if(T){
+  library(caret)
+  library(pROC)
+  library(ggplot2)
+  library(ggpubr)
+}
+
+#set seed
+if(T){
+  set.seed(0)
+}
+
+#set output dir
+if(T){
+  output_dir <- "pdl1_19_11_23"
+  if(!dir.exists(output_dir)){
+    dir.create(output_dir)
+    dir.create(file.path(output_dir, "figures"))
+    dir.create(file.path(output_dir, "tables"))
+    
+  }
+}
+
+#utility_functions
+if(T){
+  
+  clean_dcm_str <- function(x){
+    x <- gsub(".* \\'", "",  x)
+    x <- gsub(".* \\\"", "",  x)
+    x <- gsub("\\'.*", "",  x)
+    x <- gsub("\\\".*", "",  x)
+    x <- tolower(x)
+    x <- gsub(" ", "_", x)
+    return(x)
+  }
+  
+  fac2 <- function(x, levels=NULL){
+    if(!is.null(levels)){
+      factor(x, exclude=NULL, levels=levels)
+    }else{
+      factor(x, exclude=NULL)
+    }
+  }
+  
+  format_p <- function(x,table=F){
+    x_out <- x
+    x_out[x<0.001]<- "<.001"
+    x_out[0.001<=x&x<0.01]<- round(x[0.001<=x&x<0.01], 3)
+    x_out[0.01<=x&x<0.05]<- round(x[0.01<=x&x<0.05], 2)
+    x_out[0.001<=x&x<0.05] <- paste0("=", substr(x_out[0.001<=x&x<0.05], 2, nchar(x_out[0.001<=x&x<0.05])))
+    x_out[x>=0.05] <- ">.05"
+    if(table){
+      x_out <- gsub("<", "< 0", x_out)
+      x_out <- gsub("=", "0", x_out)
+    }
+    
+    return(x_out)
+  }
+  
+  auc_func <- function(y, yhat, n_bs=1000){
+    
+    n <- length(y)
+    estimate <-  ModelMetrics::auc(actual=y,
+                                   predicted=yhat)
+    auc_bs <- sapply(1:n_bs, function(bs_i){
+      bs_idx <- sample(n, replace=T)
+      auc_bs_i <- ModelMetrics::auc(actual=y[bs_idx],
+                                    predicted=yhat[bs_idx])
+      return(auc_bs_i)
+    })
+    out_i <- data.frame(
+      estimate=round(estimate, 2),
+      ci_lo=round(quantile(auc_bs, 0.025),2),
+      ci_hi=round(quantile(auc_bs, 0.975),2)
+    )
+    rownames(out_i) <- NULL
+    return(out_i)
+  }
+  
+  cor_func <- function(y, yhat, n_bs=1000, alternative){
+    
+    test_i <- suppressWarnings(
+      cor.test(y,
+               yhat,
+               method="spearman",
+               alternative=alternative)
+    )
+    n <- length(y)
+    cor_bs <- sapply(1:n_bs, function(bs_i){
+      bs_idx <- sample(n, replace=T)
+      cor_bs_i <- cor(y[bs_idx],
+                      yhat[bs_idx],
+                      method="spearman")
+      return(cor_bs_i)
+    })
+    out_i <- data.frame(
+      estimate=round(test_i$estimate, 2),
+      ci_lo=round(quantile(cor_bs, 0.025),2),
+      ci_hi=round(quantile(cor_bs, 0.975),2),
+      p_val=test_i$p.value
+    )
+    rownames(out_i) <- NULL
+    return(out_i)
+  }
+  
+}
+
+#published models
+if(T){
+  
+  #Bracci
+  bracci_mod_df <- data.frame(
+    feature=c(
+      "intercept",
+      "original_firstorder_Skewness",
+      "original_glszm_LowGrayLevelZoneEmphasis"
+    ),
+    beta=c(
+      -1.192,-0.937, -11259862
+    ),
+    rad_params="oshea",
+    thres=-0.745,
+    tps=50
+  )
+  
+  
+  
+  #Jiang
+  jiang_mod_df <- data.frame(
+    feature=c(
+      "intercept",
+      "log.sigma.4.0.mm.3D_glszm_SmallAreaLowGrayLevelEmphasis",
+      "wavelet.LHL_glcm_ClusterShade",
+      "wavelet.LHH_firstorder_Kurtosis",
+      "wavelet.LHH_glcm_Idn",
+      "wavelet.HLL_firstorder_RootMeanSquared",
+      "wavelet.HLL_ngtdm_Complexity",
+      "wavelet.HHH_firstorder_Median",
+      "wavelet.HHH_firstorder_Skewness",
+      "wavelet.HHH_glszm_SizeZoneNonUniformityNormalized"
+    ),
+    beta=c(0,
+           -1.09552856,-0.86632614,0.58220868,0.97471849, -0.77145334,
+           -0.92267150, 0.84877258, 0.52749997, 0.77429202
+    ),
+    rad_params="jiang",
+    thres=NA,
+    tps=50
+  )
+  #Yoon
+  yoon_mod_df <- data.frame(
+    feature=c(
+      "intercept",
+      "original_glcm_JointEnergy",
+      "original_glrlm_RunVariance",
+      "original_glrlm_RunEntropy",
+      "original_glrlm_ShortRunLowGrayLevelEmphasis"
+    ),
+    beta=c(
+      -1.59423,-8.49568, 3.58597, -5.01416, 0.05253
+    ),
+    rad_params="oshea",
+    thres=-0.715,
+    tps=1
+  )
+  
+  
+  all_mods_list <- list(
+    "Model 1"=bracci_mod_df,
+    "Model 2"=jiang_mod_df,
+    "Model 3"=yoon_mod_df
+  )
+}
+
+#set radiomics directory
+if(T){
+  radiomics_dir <- "~/Documents/PycharmProjects/REPLICA/radiomic_features_04_07_23_all_types"
+  #use updated replica dir
+}
+
+#lung2
+if(T){
+  
+  #clinicoradiomic data
+  if(T){
+    
+    replica_radiomics_dir <- '~/Documents/PycharmProjects/REPLICA/radiomic_features_12_11_23_all_types'
+    lung2_radiomic_file <- file.path(replica_radiomics_dir, "lung2.csv")
+    lung2_radiomic_df <- read.csv(lung2_radiomic_file)[,-1]
+    lung2_clinical_df <- read.csv("~/Documents/Datasets/Lung2/clinical_data.csv")
+    colnames(lung2_clinical_df)[1]<- "patient_id"
+    lung2_clinicoradiomic_df <- merge.data.frame(lung2_clinical_df, lung2_radiomic_df)
+    
+    #lung2
+    os_time <- 
+      as.Date(lung2_clinicoradiomic_df$Date.of.Last.Known.Alive, format="%m/%d/%Y")-
+      as.Date(lung2_clinicoradiomic_df$CT.Date, format="%m/%d/%Y")
+    os_event <- lung2_clinicoradiomic_df$Survival.Status =="Dead"
+    age <- lung2_clinicoradiomic_df$Age.at.Histological.Diagnosis
+    female <- lung2_clinicoradiomic_df$Gender=="Female"
+    lung2_clinicoradiomic_df$Pathological.T.stage[lung2_clinicoradiomic_df$Pathological.T.stage=="Tis"]<- "T0"
+    t_stage <- as.numeric(substr(lung2_clinicoradiomic_df$Pathological.T.stage,2,2))
+    n_stage <- as.numeric(substr(lung2_clinicoradiomic_df$Pathological.N.stage,2,2))
+    m_stage <- as.numeric(substr(lung2_clinicoradiomic_df$Pathological.M.stage,2,2))
+    smoking <- ifelse(lung2_clinicoradiomic_df$Smoking.status=="Nonsmoker", "nonsmoking", "smoking")
+    institution <- lung2_clinicoradiomic_df$Patient.affiliation
+    histology <- lung2_clinicoradiomic_df$Histology
+    patient_id <- lung2_clinicoradiomic_df$patient_id
+    clin <- cbind(age, female, t_stage, n_stage, m_stage)
+    class(clin)<- "numeric"
+    acq_metadata <- lung2_clinicoradiomic_df[,grep("^acq_", colnames(lung2_clinicoradiomic_df))]
+    acq_metadata[] <- lapply(acq_metadata, clean_dcm_str)
+    radiomics <- lung2_clinicoradiomic_df[,grep("oshea|jiang", colnames(lung2_clinicoradiomic_df))]
+    lung2_data <- cbind.data.frame(
+      dataset="lung2",
+      institution,
+      patient_id,
+      histology,
+      smoking=smoking,
+      os_time,
+      os_event,
+      clin,
+      radiomics,
+      acq_metadata
+    )
+    
+  }
+  
+  #genomic data
+  if(T){
+    
+    preselected_gene_vec <- c(
+      CD274="ENSG00000120217"
+    )
+    preselected_gene_df <- data.frame(
+      gene_name=names(preselected_gene_vec),
+      ensembl_id=preselected_gene_vec
+    )
+    
+    lung2_genomic_df <- read.delim("~/Documents/Datasets/Lung2/GSE103584_RNAseq.txt", row.names="X")
+    colnames(lung2_genomic_df) <- gsub("\\.", "-", colnames(lung2_genomic_df))
+    patient_id <- colnames(lung2_genomic_df)
+    lung2_genomic_df <- t(lung2_genomic_df)
+    lung2_genomic_df <- lung2_genomic_df[,match(preselected_gene_df$gene_name, colnames(lung2_genomic_df))]
+    lung2_genomic_df[is.na(lung2_genomic_df)] <- 0
+    lung2_genomic_df <- as.data.frame(lung2_genomic_df)
+    lung2_genomic_df$patient_id <- patient_id
+    colnames(lung2_genomic_df)[1]<- "pdl1"
+  }
+  
+  #merge datasets
+  if(T){
+    
+    lung2_df <- merge.data.frame(x=lung2_data,
+                                 y=lung2_genomic_df,
+                                 all.x=F,
+                                 all.y=F)
+    
+  }
+  
+}
+
+#replica
+if(T){
+  
+  #radiomics import
+  if(T){
+    
+    replica_radiomics_file <- file.path(radiomics_dir, "replica.csv")#replica_3
+    replica_radiomics_df <- read.csv(replica_radiomics_file)[,-1]
+    replica_radiomics_df <- replica_radiomics_df[!duplicated(replica_radiomics_df),]
+    replica_radiomics_df$patient_id <- gsub("_.*","", replica_radiomics_df$id)
+    replica_radiomics_df$study_date <- gsub(".*_","", replica_radiomics_df$id)
+    replica_radiomics_df$study_date <- as.Date(
+      paste(
+        substr(replica_radiomics_df$study_date,7,8),
+        substr(replica_radiomics_df$study_date,5,6),
+        substr(replica_radiomics_df$study_date,1,4),
+        sep="/"
+      ),
+      format = "%d/%m/%Y"
+    )
+    replica_radiomics_df$annotator <- factor(replica_radiomics_df$annotator, levels=c("CHTM", "CH", "TM", "RO"))
+  }
+  
+  #clinical data import
+  if(T){
+    replica_data <- read.delim("#", skip=1, header = T)
+    replica_data <- replica_data[!is.na(replica_data$X),]
+    all_patients <- unique(replica_data$X)
+    n_patients_total <- length(all_patients)
+    #removed
+  }
+  
+  #data cleaning
+  if(T){
+    
+    #replica
+    patient_id <- as.character(replica_data$patient_id)
+    study_date <- as.Date(replica_data$Date.of.CT, format = "%d/%m/%Y")
+    ltfu_date <- as.Date(replica_data$Censor, format = "%d-%b-%y")
+    os_time <- as.numeric(ltfu_date- study_date)
+    os_event <- 1-replica_data$X0.Deceased..1.Alive
+    age <- as.numeric(replica_data$Age.at.surgery.x)
+    female <- as.numeric(replica_data$Sex.x=="F")
+    t_stage <- as.numeric(substr(replica_data$pT,1,1))
+    n_stage <- as.numeric(substr(replica_data$pN,1,1))
+    m_stage <- as.numeric(substr(replica_data$pM,1,1))
+    smoking <- replica_data$Smoking.History
+    smoking[smoking=="Y (a couple months)"] <- "Y"
+    smoking <- c("nonsmoking", "unknown", "smoking")[factor(smoking)]
+    nonsmoking <- as.numeric(replica_data$Smoking.History=="N")
+    histology <- tolower(replica_data$Histology)
+    hist_adeno <- ifelse(grepl("adeno", tolower(replica_data$Histology)), "A", "")
+    hist_squam <- ifelse(grepl("squam", tolower(replica_data$Histology)), "S", "")
+    hist_lcc <- ifelse(grepl("large", tolower(replica_data$Histology)), "L", "")
+    hist <- do.call(paste0, list(hist_adeno, hist_squam, hist_lcc))
+    pdl1 <- replica_data$REPLICA.1T.PD.L1.R2
+    pdl1[pdl1%in%c("e0clude", "not received")]<- NA
+    pdl1[pdl1=="<1"] <- 0
+    pdl1 <- as.numeric(pdl1)
+    performance_status <- replica_data$Performance.Status.at.Surgery
+    performance_status[performance_status==99]<- NA
+    
+    institution <- replica_data$Instuition.name
+    institution[institution=="Guys "] <-"Guys"
+    institution[grep("Medway", institution)] <- "Medway"
+    institution[grep("InHealth", institution)] <- "InHealth"
+    institution[grep("Alliance", institution)] <- "Alliance"
+    institution[grep("Conquest", institution)] <- "Conquest"
+    institution[institution==""] <- "Guys"
+    institution[institution=="University Hospital Lewisham"] <- "Lewisham"
+    institution <- gsub(" Hospital", "", institution)
+    contrast <- 1-replica_data$Contrast...0.Non.1
+    overall_stage <- tolower(replica_data$I.IV.Stage)
+    clin_df <- data.frame(patient_id=patient_id,
+                          age=age,
+                          female=female,
+                          t_stage=t_stage,
+                          n_stage=n_stage,
+                          m_stage=m_stage,
+                          histology=hist,
+                          pdl1=pdl1,
+                          smoking=smoking,
+                          institution=institution,
+                          contrast=contrast,
+                          overall_stage=overall_stage,
+                          os_time=os_time,
+                          os_event=os_event)
+    replica_df <- merge.data.frame(clin_df, replica_radiomics_df, by="patient_id", how="inner")
+    clin_cols <- c("age", "female", "t_stage", "n_stage")
+    rad_cols <- grep("rinaldi|jiang", colnames(replica_df), value=T)
+    clinrad_cols <- c(clin_cols, rad_cols)
+    
+    n_patients_total <- length(unique(clin_df$patient_id))
+    institution_counts_total <- sort(table(clin_df$institution), decreasing=T)
+    patients_without_pdl1 <- unique(replica_df$patient_id[is.na(replica_df$pdl1)])
+    n_patients_without_pdl1 <- length(patients_without_pdl1)
+    replica_df <- replica_df[!is.na(replica_df$pdl1),]
+  }
+  
+  #exclusions_df
+  if(T){
+    
+    exclusions_df <- read.csv(file.path(radiomics_dir, "replica_exclusions.csv"))
+    exclusions_df$scan_date <- gsub(".*_", "", exclusions_df$patient_id)
+    exclusions_df$patient_id <- gsub("_.*", "", exclusions_df$patient_id)
+    exclusions_df <- exclusions_df[exclusions_df$patient_id%in% replica_data$patient_id,]
+    exclusions_df <- exclusions_df[!duplicated(exclusions_df$patient_id),]
+    patients_with_thick_scans <- exclusions_df$patient_id[exclusions_df$exclusion_criterion=="thick_slice"]
+    n_patients_with_thick_scans <- length(patients_with_thick_scans)
+    patients_with_corrupt_images <- exclusions_df$patient_id[exclusions_df$exclusion_criterion=="corrupt"]
+    n_patients_with_corrupt_images <- length(patients_with_corrupt_images)
+    
+    patients_with_ct_unavailable <- setdiff(replica_data$patient_id,
+                                            c(patients_with_hospital_record_unavailable,
+                                              patients_with_corrupt_images,
+                                              patients_with_thick_scans,
+                                              patients_without_pdl1,
+                                              replica_df$patient_id
+                                            ))
+    n_patients_with_ct_unavailable <- length(patients_with_ct_unavailable)
+    n_excluded_total <- n_hospital_record_unavailable+n_patients_with_corrupt_images+
+    n_patients_with_thick_scans+n_patients_without_pdl1+n_patients_with_ct_unavailable
+    n_included_patients <- length(unique(replica_df$patient_id))
+    
+  }
+  
+}
+
+#preprocess data
+if(T){
+  
+  test_df <- replica_df
+  test_df <- test_df[order(test_df$annotator),]
+  test_df <- test_df[!duplicated(test_df$patient_id),]
+  all_rad_vars <- grep("oshea|jiang", colnames(lung2_df), value=T)
+  
+  extract_standardisation_transforms <- function(X_standardisation){
+    m_standardisation <- colMeans(X_standardisation)
+    s_standardisation <- apply(X_standardisation, 2, sd)
+    out <- data.frame(
+      m=m_standardisation,
+      s=s_standardisation
+    )
+    return(out)
+  }
+  
+  standardise_func <- function(X, standardisation_transform){
+    X <- as.matrix(X)
+    X <- t(t(X) - standardisation_transform$m)
+    X <- t(t(X) / standardisation_transform$s)
+    return (X)
+  }
+  
+  standardisation_list <- lapply(list(
+    public=lung2_df[all_rad_vars]
+  ), FUN=extract_standardisation_transforms)
+  
+  X_test <- as.matrix(test_df[all_rad_vars])
+  X_standardisation_list <- list(
+    Unstandardised=X_test,
+    Standardised=standardise_func(X_test,  standardisation_list$public)
+  )
+  y <- test_df$pdl1
+  n <- length(y)
+  
+  
+}
+
+#fit CD274 model
+if(T){
+  
+  selected_model <- 'Model 3'
+  
+  selected_rad_vars <- all_mods_list[[selected_model]]$feature[-1]
+  selected_rad_vars <- paste0("oshea_", selected_rad_vars)
+  formula_i <- as.formula(paste0("pdl1~", paste(selected_rad_vars, collapse="+")))
+  lung2_df_scaled <- lung2_df
+  lung2_df_scaled[selected_rad_vars]<- scale(lung2_df[selected_rad_vars])
+  CD274_mod <- lm(formula_i,
+                  data=lung2_df_scaled)
+  
+  #CD274 model
+  CD274_mod_df <- all_mods_list[[selected_model]]
+  CD274_mod_df$beta <- coef(CD274_mod)
+  CD274_mod_df$thres <- NA
+  all_mods_list[['Model 3b']] <- CD274_mod_df
+  
+  
+  
+}
+
+#validate models
+if(T){
+  
+  params_grid <- expand.grid(
+    model_name=names(all_mods_list),
+    standardisation=names(X_standardisation_list),
+    stringsAsFactors = F
+  )
+  params_grid <- params_grid[!(params_grid$model_name=="Model 3b"& params_grid$standardisation=="Unstandardised"),]
+  
+  validate_discrimination <- function(model_name, standardisation, n_bs=1e3){
+    
+    set.seed(0)
+    mod_df <- all_mods_list[[model_name]]
+    rad_params <- mod_df$rad_params[1]
+    predictors <- paste0(rad_params, "_", mod_df$feature[-1])
+    beta <- mod_df$beta
+    thres <- mod_df$thres[1]
+    
+    X <- X_standardisation_list[[standardisation]][,predictors,drop=F]
+    score <- beta[1]+ X%*%beta[-1]
+    
+    roc_model_1 <- roc(response=y>=1, predictor=c(score),
+                       levels=c(control = F, case = T),
+                       direction="<")
+    roc_null_1 <- roc(response=y>=1, predictor=rep(1, n),
+                      levels=c(control = F, case = T),
+                      direction="<")
+    p_auc_1 <- pROC::roc.test(roc_model_1, roc_null_1,
+                              alternative="greater"
+    )$p.value
+    roc_model_50 <- roc(response=y>=50, predictor=c(score),
+                        levels=c(control = F, case = T),
+                        direction="<")
+    roc_null_50 <- roc(response=y>=50, predictor=rep(1, n),
+                       levels=c(control = F, case = T),
+                       direction="<")
+    p_auc_50 <- pROC::roc.test(roc_model_50, roc_null_50,
+                               alternative="greater"
+    )$p.value
+    p_cor <- cor.test(score,
+                      y,
+                      alternative = "greater",
+                      method="spearman",
+                      exact=F)$p.value
+    
+    bs_performance <- lapply(1:n_bs, function(bs_i){
+      
+      bs_idx <- sample(n, replace = T)
+      y_bs <- y[bs_idx]
+      score_bs <- score[bs_idx]
+      auc_1_bs <- roc(response=y_bs>=1, predictor=c(score_bs),
+                      levels=c(control=F,case=T),
+                      direction="<")$auc
+      auc_50_bs <- roc(response=y_bs>=50, predictor=c(score_bs),
+                       levels=c(control=F,case=T),
+                       direction="<")$auc
+      cor_bs <- cor(score_bs, y_bs, method="spearman")
+      out_bs_i <- data.frame(
+        AUC_1=auc_1_bs,
+        AUC_50=auc_50_bs,
+        Rho=cor_bs
+      )
+      return(out_bs_i)
+    })
+    bs_performance <- do.call(rbind, bs_performance)
+    bs_performance <- apply(bs_performance, 2, function(x){
+      c(mean(x), quantile(x, probs=(c(0.025, 0.975))))
+    })
+    out_i <- list(
+      model_name=model_name,
+      standardisation=standardisation,
+      bs_performance=bs_performance,
+      p_auc_1=p_auc_1,
+      p_auc_50=p_auc_50,
+      p_cor=p_cor
+    )
+    return(out_i)
+  }
+  performance_list <- lapply(1:nrow(params_grid), function(params_i){
+    
+    print(params_i)
+    model_name <- params_grid$model_name[params_i]
+    standardisation <- params_grid$standardisation[params_i]
+    
+    out_i <- validate_discrimination(model_name, standardisation)
+    return(out_i)
+  })
+  
+}
+
+#plot discrimination
+if(T){
+  
+  discrim_df <- lapply(performance_list, function(list_i){
+    
+    bs_performance <- as.data.frame(t(list_i$bs_performance))
+    colnames(bs_performance)<- c("y", "ymin", "ymax")
+    bs_performance$metric <- rownames(bs_performance)
+    rownames(bs_performance)<- NULL
+    df_i <- data.frame(
+      model=list_i$model_name,
+      standardisation=list_i$standardisation,
+      bs_performance
+    )
+    return(df_i)
+    
+  })
+  discrim_df <- do.call(rbind, discrim_df)
+  discrim_df$tps <- gsub(".*_", "", discrim_df$metric)
+  discrim_df$tps <- paste0("TPS \u2265", discrim_df$tps, "%")
+  discrim_df$tps[discrim_df$metric=="Rho"]<- ""
+  #discrim_df$model <- c("Model 1","Model 2", "Model 3", "Model 3b")[
+  #  as.numeric(factor(discrim_df$model,levels=c("Bracci", "Jiang", "Yoon", "CD274_model")))]
+  discrim_df$standardisation <- factor(discrim_df$standardisation,
+                                       levels=c("Unstandardised",
+                                                "Standardised"
+                                       ))
+  
+  cor_plot <- ggplot(discrim_df[discrim_df$metric=="Rho",],
+                     aes(x=model,colour=model, y=y, ymin=ymin, ymax=ymax)
+  )+
+    geom_hline(yintercept=0, linetype=2, colour="red")+
+    geom_errorbar(width=0.5)+
+    geom_point(aes(colour=model), size=3.2)+
+    facet_grid(tps~standardisation, scales = "free_x")+
+    ylab("Spearman Correlation")+
+    scale_colour_manual(values=c("forestgreen", "darkviolet", "darkorange2", "midnightblue"))+
+    theme(legend.position = "none")+
+    xlab(element_blank())
+  
+  auc_plot <- ggplot(discrim_df[discrim_df$metric!="Rho",],
+                     aes(x=model,colour=model, y=y, ymin=ymin, ymax=ymax))+
+    geom_hline(yintercept=0.5, linetype=2, colour="red")+
+    geom_errorbar(width=0.5)+
+    geom_point(aes(colour=model), size=3.2)+
+    facet_grid(tps~standardisation, scales = "free_x")+
+    ylab("Area Under Curve")+
+    scale_colour_manual(values=c("forestgreen", "darkviolet", "darkorange2", "midnightblue"))+
+    theme(legend.position = "none")+
+    xlab(element_blank())
+  
+  discrim_plots <- ggarrange(plotlist = list(cor_plot, auc_plot),
+                             nrow=2,
+                             heights = c(1, 2)
+  )
+  ggsave(discrim_plots,
+         filename=file.path(output_dir, "figures/discrim_plots.png"),
+         dpi=600,
+         units='in',
+         width=8,
+         height=8)
+  
+}
+
+#discrimination df
+if(T){
+  
+  discrim_table <- lapply(performance_list, function(list_i){
+    
+    bs_performance <- round(list_i$bs_performance, 2)
+    p_vals <- round(c(list_i$p_auc_1, list_i$p_auc_50, list_i$p_cor), 4)
+    
+    res_text <- paste0(bs_performance[1,], " [", bs_performance[2,], ", ",
+                       bs_performance[3,], "]", " P=", p_vals
+    )
+    names(res_text)<- colnames(bs_performance)
+    res_text <- t(as.data.frame(res_text))
+    rownames(res_text)<- NULL
+    df_i <- data.frame(
+      model=list_i$model_name,
+      standardisation=list_i$standardisation,
+      res_text
+    )
+    return(df_i)
+    
+  })
+  discrim_table <- do.call(rbind, discrim_table)
+  discrim_table <- discrim_table[,c(1,2,5,3,4)]
+  colnames(discrim_table)[1:2] <- c("Model", "Standardisation")
+  write.table(discrim_table,
+              file=file.path(output_dir, "tables/discrim_table.tsv"),
+              row.names = F)
+  
+}
+
+#partial correlation analysis
+if(T){
+  
+  df_list <- list(Train=lung2_df, Test=test_df)
+  param_grid <- expand.grid(
+    rep=1:1e3,
+    dataset=names(df_list)
+  )
+  cor_df <- lapply(1:nrow(param_grid), function(params_i){
+    
+    dataset_i <- param_grid$dataset[params_i]
+    df_i <- df_list[[dataset_i]]
+    bs_i <- sample(nrow(df_i), replace=T)
+    df_i <- df_i[bs_i,]
+    cor_i <- cor(df_i[,c("pdl1", selected_rad_vars,
+                         "oshea_original_shape_VoxelVolume")],
+                 method="spearman")[-1,1]
+    out_i <- data.frame(
+      dataset=dataset_i,
+      feature=names(cor_i),
+      cor=unname(cor_i)
+    )
+    return(out_i)
+  })
+  cor_df <- do.call(rbind, cor_df)
+  rownames(cor_df)<- NULL
+  agg_func <- function(x){
+    estimate=round(mean(x), 2)
+    ci_lo=round(quantile(x, 0.025),2)
+    ci_hi=round(quantile(x, 0.975),2)
+    out_i <- paste0(
+      estimate, " [", ci_lo, ", ", ci_hi, "]"
+    )
+    return(out_i)
+  }
+  cor_agg_df <- aggregate(cor_df$cor, by=cor_df[,1:2], FUN=agg_func)
+  cor_agg_df <- cbind(cor_agg_df[cor_agg_df$dataset=="Train",-1],
+                      cor_test=cor_agg_df$x[cor_agg_df$dataset!="Train"]
+  )
+  colnames(cor_agg_df)[2]<- "cor_train"
+  cor_agg_df$feature <- gsub("^original_", "", cor_agg_df$feature)
+  cor_agg_df <- cor_agg_df[c(2:4, 1, 5),]
+  
+  
+  df_list <- list(Train=lung2_df, Test=test_df)
+  param_grid <- expand.grid(
+    rep=1:1e3,
+    dataset=names(df_list)
+  )
+  pcor_df <- lapply(1:nrow(param_grid), function(params_i){
+    
+    dataset_i <- param_grid$dataset[params_i]
+    df_i <- df_list[[dataset_i]]
+    bs_i <- sample(nrow(df_i), replace=T)
+    df_i <- df_i[bs_i,]
+    cor_i <- cor(df_i[,c("pdl1", selected_rad_vars,
+                         "oshea_original_shape_VoxelVolume")],
+                 method="spearman")
+    pcor_i <- -cov2cor(solve(cor_i))[-1,1]
+    out_i <- data.frame(
+      dataset=dataset_i,
+      feature=names(pcor_i),
+      pcor=unname(pcor_i)
+    )
+    return(out_i)
+  })
+  pcor_df <- do.call(rbind, pcor_df)
+  rownames(pcor_df)<- NULL
+  agg_func <- function(x){
+    estimate=round(mean(x), 2)
+    ci_lo=round(quantile(x, 0.025),2)
+    ci_hi=round(quantile(x, 0.975),2)
+    out_i <- paste0(
+      estimate, " [", ci_lo, ", ", ci_hi, "]"
+    )
+    return(out_i)
+  }
+  pcor_agg_df <- aggregate(pcor_df$pcor, by=pcor_df[,1:2], FUN=agg_func)
+  pcor_agg_df <- cbind(pcor_agg_df[pcor_agg_df$dataset=="Train",-1],
+                       pcor_test=pcor_agg_df$x[pcor_agg_df$dataset!="Train"]
+  )
+  colnames(pcor_agg_df)[2]<- "pcor_train"
+  pcor_agg_df$feature <- gsub("^original_", "", pcor_agg_df$feature)
+  pcor_agg_df <- pcor_agg_df[c(2:4, 1, 5),]
+  
+  cor_agg_df <- cbind(cor_agg_df, pcor_agg_df[,-1])
+  cor_agg_df$feature <- gsub("oshea_original_", "", cor_agg_df$feature)
+  
+  write.table(cor_agg_df,
+              file=file.path(output_dir, "tables/cor_agg_df.tsv"),
+              row.names = F)
+  
+  
+  
+  
+  
+}
+
+#data characteristics
+if(T){
+  
+  df_list <- list(Train=lung2_df, Test=test_df)
+  df_list$Train$partition <- "Train"
+  df_list$Test$partition <- "Test"
+  
+  participant_summary_vars <- c("age", "female","smoking", "histology","t_stage", "n_stage", "pdl1")
+  acq_param_vars <- c("acq_scanner_manufacturer","acq_kernel", "acq_xr_current","acq_kvp", "acq_exposure_time", "acq_exposure", "acq_voxel_dim")
+  
+  all_data <- df_list
+  all_data <- list(
+    df_list$Train[c(participant_summary_vars,
+                    acq_param_vars,
+                    "partition", "patient_id")],
+    df_list$Test[c(participant_summary_vars,
+                   acq_param_vars,
+                   "partition", "patient_id")]
+  )
+  all_data$All <- rbind(all_data[[1]], all_data[[2]])
+  all_data$All$partition <-"All"
+  
+  all_data <- do.call(rbind, all_data)
+  all_data$partition <- factor(all_data$partition, levels=c("Train", "Test", "All"))
+  
+  #clinical characteristics
+  all_data$Age_fac <- "years"
+  all_data$Sex_fac <- factor(ifelse(all_data$female, "female", "male"))
+  all_data$Smoking_fac <- fac2(all_data$smoking)
+  all_data$histology <- tolower(all_data$histology)
+  all_data$histology[all_data$histology=="a"]<- "adenocarcinoma"
+  all_data$histology[all_data$histology=="as"]<- "adenocarcinoma/squamous cell carcinoma"
+  all_data$histology[all_data$histology=="l"]<- "large cell carcinoma"
+  all_data$histology[all_data$histology=="s"]<- "squamous cell carcinoma"
+  all_data$histology[all_data$histology=="NSCLC NOS (not otherwise specified)"]<- "other"
+  all_data$histology <- fac2(all_data$histology)
+  all_data$pT_stage_fac <- fac2(paste0("pT", all_data$t_stage))
+  all_data$pN_stage_fac <- fac2(paste0("pN", all_data$n_stage))
+  all_data$PDL1_fac <- cut(all_data$pdl1, breaks = c(0, 1, 50, 100), include.lowest = T, right=F)
+  
+  #image characteristics
+  all_data$acq_scanner_manufacturer <- toupper(gsub("_", " ", all_data$acq_scanner_manufacturer))
+  all_data$acq_scanner_manufacturer[all_data$acq_scanner_manufacturer==""]<- "Unknown"
+  all_data$acq_Scanner_Manufacturer_fac <- fac2(all_data$acq_scanner_manufacturer)
+  all_data$acq_kernel[all_data$kernel%in%c("2", "3", "b", "c")]<- "other"
+  all_data$acq_kernel[!all_data$acq_kernel %in% names(sort(-table(all_data$acq_kernel))[1:8])]<- "other"
+  all_data$acq_Kernel_fac <- fac2(all_data$acq_kernel)
+  all_data$acq_XR_Current_fac <- as.character(cut(as.numeric(all_data$acq_xr_current),
+                                                  breaks=c(0, 200, 500, 1000), dig.lab = 5))
+  all_data$acq_XR_Current_fac[is.na(all_data$acq_XR_Current_fac)] <- "unknown"
+  all_data$acq_XR_Current_fac <- fac2(all_data$acq_XR_Current_fac)
+  all_data$acq_kVp_fac <- fac2(as.numeric(all_data$acq_kvp))
+  all_data$acq_Exposure_Time_fac <- as.numeric(all_data$acq_exposure_time)
+  all_data$acq_Exposure_Time_fac <- as.character(cut(all_data$acq_Exposure_Time_fac,
+                                                     breaks=c(0, 400, 800, 1200), dig.lab = 5))
+  all_data$acq_Exposure_Time_fac[is.na(all_data$acq_Exposure_Time_fac)]<- "unknown"
+  all_data$acq_Exposure_Time_fac <- fac2(all_data$acq_Exposure_Time_fac)
+  all_data$acq_Exposure_fac <- as.character(cut(as.numeric(all_data$acq_exposure),
+                                                breaks=c(0, 100, 200, 300, Inf), dig.lab = 5))
+  all_data$acq_Exposure_fac[is.na(all_data$acq_Exposure_fac)] <- "unknown"
+  all_data$acq_Exposure_fac <- fac2(all_data$acq_Exposure_fac)
+  all_data$acq_Voxel_Width_fac <- as.character(cut(as.numeric(all_data$acq_voxel_dim),
+                                                   breaks=c(0.5, 0.7, 0.9, 1), dig.lab = 5))
+  all_data$acq_Voxel_Width_fac[is.na(all_data$acq_Voxel_Width_fac)] <- "unknown"
+  all_data$acq_Voxel_Width_fac <- factor(all_data$acq_Voxel_Width_fac)
+  
+  extract_summaries <- function(all_data, table_type="participant", test_p=T){
+    
+    summary_vars <- grep("_fac$", colnames(all_data), value=T)
+    if(table_type=="acq"){
+      summary_vars <- summary_vars[grepl("^acq_", summary_vars)]
+    }else{
+      all_data <- all_data[!duplicated(all_data[,c("patient_id", "partition")]),]
+      summary_vars <- summary_vars[!grepl("^acq_", summary_vars)]
+    }
+    summary_list <- lapply(summary_vars, function(summary_var_i){
+      
+      tbl_i <- table(as.data.frame(all_data[,c( summary_var_i, "partition")]))
+      if (nrow(tbl_i)>1&test_p){
+        test_i <- suppressWarnings(fisher.test(tbl_i[,1:2]))
+      }else{
+        test_i <- list(p.value=NA)
+      }
+      tbl_i[] <- paste0("n=", tbl_i, " (", 100*round(t(t(tbl_i)/colSums(tbl_i)), 2), "%)")
+      tbl_i <- cbind(rownames(tbl_i), tbl_i)
+      mat_i <- matrix("", nrow(tbl_i)+1, 6)
+      mat_i[-1,2:5]<- tbl_i
+      mat_i[1]<- gsub("_fac", "", summary_var_i)
+      mat_i[nrow(mat_i),6]<- round(test_i$p.value, 5)
+      return(mat_i)
+    })
+    summary_list <- do.call(rbind, summary_list)
+    colnames(summary_list)<- c("Variable", "Value", "Public", "Validation","All", "P-value")
+    return(summary_list)
+    
+  }
+  participant_summaries <- extract_summaries(all_data)
+  participant_summaries[2,3] <- paste0("m=", round(mean(all_data$age[all_data$partition=="Train"])),
+                                       ", s=", round(sd(all_data$age[all_data$partition=="Train"]))
+  )
+  participant_summaries[2,4] <- paste0("m=", round(mean(all_data$age[all_data$partition=="Test"])),
+                                       ", s=", round(sd(all_data$age[all_data$partition=="Test"]))
+  )
+  participant_summaries[2,5] <- paste0("m=", round(mean(all_data$age[all_data$partition=="All"])),
+                                       ", s=", round(sd(all_data$age[all_data$partition=="All"]))
+  )
+  participant_summaries[2,6]<- round(t.test(all_data$age[all_data$partition=="Train"],
+                                            all_data$age[all_data$partition=="Test"])$p.value, 5)
+  
+  image_parameter_summaries <- extract_summaries(all_data, table_type="acq", test_p=F)
+  
+  write.csv(participant_summaries,
+            file.path(output_dir, "tables/participant_summaries.csv"),
+            row.names = F)
+  write.csv(image_parameter_summaries,
+            file.path(output_dir, "tables/image_parameter_summaries.csv"),
+            row.names = F)
+  
+}
+
+#reproducibility
+if(T){
+  
+  reproducibility_ids <- unique(replica_df$patient_id[duplicated(replica_df$patient_id)])
+  reproducibility_df <- replica_df[replica_df$patient_id %in% reproducibility_ids,]
+  annotator_reproducibility_df <- lapply(selected_rad_vars, function(feature_i){
+    formula_i <- as.formula(paste0(feature_i, "~", "annotator"))
+    lm_i <- lm(formula_i, data=reproducibility_df)
+    test_i <- anova(lm_i)
+    out_i <- data.frame(
+      variable="segmentation_annotator",
+      feature=feature_i,
+      df=test_i$Df[1],
+      f_score=test_i$`F value`[1],
+      p_value=test_i$`Pr(>F)`[1]
+    )
+    return(out_i)
+  })
+  annotator_reproducibility_df <- do.call(rbind.data.frame, annotator_reproducibility_df)
+  
+  scanner_reproducibility_df <- lapply(selected_rad_vars, function(feature_i){
+    formula_i <- as.formula(paste0(feature_i, "~", "acq_scanner_manufacturer"))
+    lm_i <- lm(formula_i, data=test_df)
+    test_i <- anova(lm_i)
+    out_i <- data.frame(
+      variable="scanner_manufacturer",
+      feature=feature_i,
+      df=test_i$Df[1],
+      f_score=test_i$`F value`[1],
+      p_value=test_i$`Pr(>F)`[1]
+    )
+    return(out_i)
+  })
+  scanner_reproducibility_df <- do.call(rbind.data.frame, scanner_reproducibility_df)
+  reproducibility_df <- rbind(annotator_reproducibility_df,
+                              scanner_reproducibility_df)
+  reproducibility_df$feature <- gsub("^original_", "", reproducibility_df$feature)
+  reproducibility_df$f_score <- round(reproducibility_df$f_score, 2)
+  reproducibility_df$p_value <- round(reproducibility_df$p_value, 3)
+  reproducibility_df$feature <- gsub("oshea_original_", "", reproducibility_df$feature)
+  write.csv(reproducibility_df,
+            file=file.path(output_dir, "/tables/reproducibility_df.csv"),
+            row.names = F)
+  
+  
+}
+
+#calibration
+if(T){
+  
+  params_grid <- expand.grid(
+    model_name=c("Model 1", "Model 3"),
+    standardisation=names(X_standardisation_list),
+    stringsAsFactors = F)
+  validate_calibation <- function(model_name, standardisation, n_bs=1e3){
+    
+    set.seed(0)
+    mod_df <- all_mods_list[[model_name]]
+    rad_params <- mod_df$rad_params[1]
+    predictors <- paste0(rad_params, "_", mod_df$feature[-1])
+    beta <- mod_df$beta
+    thres <- mod_df$thres[1]
+    tps <- mod_df$tps[1]
+    
+    y_f <- factor(ifelse(y>=tps, "pos", "neg"), levels=c("pos", "neg"))
+    X <- X_standardisation_list[[standardisation]][,predictors,drop=F]
+    score <- beta[1]+ X%*%beta[-1]
+    yhat_f <- factor(ifelse(score>=thres, "pos", "neg"), levels=c("pos", "neg"))
+    
+    bs_performance <- lapply(1:n_bs, function(bs_i){
+      
+      bs_idx <- sample(n, replace = T)
+      yhat_f_bs <- yhat_f[bs_idx]
+      y_f_bs <- y_f[bs_idx]
+      cm <- confusionMatrix(data=yhat_f_bs,
+                            reference=y_f_bs,
+                            positive = "pos")
+      class_performance <- c(cm$overall["Accuracy"],
+                             cm$byClass[c("Sensitivity", "Specificity", "Precision", "F1")])
+      class_performance[is.na(class_performance)]<- 0
+      return(class_performance)
+    })
+    bs_performance <- do.call(rbind, bs_performance)
+    bs_performance <- apply(bs_performance, 2, function(x){
+      c(mean(x), quantile(x, probs=(c(0.025, 0.975))))
+    })
+    if(length(unique(yhat_f))>1){
+      p_acc <- fisher.test(yhat_f, y_f)$p.value
+    }else{
+      p_acc <- 1
+    }
+    out_i <- list(
+      model_name=model_name,
+      standardisation=standardisation,
+      tps=tps,
+      bs_performance=bs_performance,
+      p_acc=p_acc
+    )
+    return(out_i)
+  }
+  
+  calibration_list <- lapply(1:nrow(params_grid), function(params_i){
+    
+    print(params_i)
+    model_name <- params_grid$model_name[params_i]
+    standardisation <- params_grid$standardisation[params_i]
+    
+    out_i <- validate_calibation(model_name, standardisation)
+    return(out_i)
+  })
+  
+  calib_table <- lapply(calibration_list, function(list_i){
+    
+    bs_performance <- round(list_i$bs_performance, 2)
+    p_val <- round(list_i$p_acc, 4)
+    tps <- list_i$tps
+    
+    res_text <- paste0(bs_performance[1,], " [", bs_performance[2,], ", ",
+                       bs_performance[3,], "]")
+    names(res_text)<- colnames(bs_performance)
+    res_text <- t(as.data.frame(res_text))
+    rownames(res_text)<- NULL
+    df_i <- data.frame(
+      Model=list_i$model_name,
+      Standardisation=list_i$standardisation,
+      TPS=tps,
+      res_text,
+      P_val=p_val
+    )
+    return(df_i)
+    
+  })
+  calib_table <- do.call(rbind, calib_table)
+  calib_table <- calib_table[order(calib_table$Model),]
+  write.table(calib_table,
+              file=file.path(output_dir, "tables/calib_table.tsv"),
+              row.names = F)
+  
+}
+
+#model reporting df
+if(T){
+  
+  all_mods_df <- lapply(seq_along(all_mods_list), function(i){
+    data.frame(
+      Model=names(all_mods_list)[i],
+      all_mods_list[[i]]
+    )
+  })
+  all_mods_df <- do.call(rbind, all_mods_df)
+  all_mods_df$feature <- paste0(all_mods_df$rad_params, "_", all_mods_df$feature)
+  all_mods_df <- all_mods_df[,1:4]
+  all_mods_df$rad_params[all_mods_df$rad_params=="oshea"]<- "Ligero"
+  all_mods_df$rad_params[all_mods_df$rad_params=="jiang"]<- "Jiang"
+  all_mods_ms <- standardisation_list[[1]][all_mods_df$feature,]
+  rownames(all_mods_ms) <- NULL
+  colnames(all_mods_ms)<- c("Feature Mean", "Feature SD")
+  all_mods_ms <- round(all_mods_ms, 5)
+  all_mods_df <- cbind(all_mods_df, all_mods_ms)
+  all_mods_df$feature <- gsub("oshea_|jiang_", "", all_mods_df$feature)
+  write.table(all_mods_df,
+              file=file.path(output_dir, "tables/all_mods_df.tsv"), row.names=F)
+  
+}
